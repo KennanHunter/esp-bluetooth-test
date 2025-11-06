@@ -3,8 +3,8 @@ debug/
 target/
 
 # Editor configuration
-.vscode/
-.zed/
+# .vscode/
+# .zed/
 .helix/
 .nvim.lua
 
