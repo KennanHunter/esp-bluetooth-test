@@ -1,48 +1,59 @@
 #![no_std]
 #![no_main]
-#![deny(
-    clippy::mem_forget,
-    reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
-    holding buffers for the duration of a data transfer."
-)]
-
-use esp_backtrace as _;
-use esp_hal::clock::CpuClock;
-use esp_hal::main;
-use esp_hal::time::{Duration, Instant};
-use esp_hal::timer::timg::TimerGroup;
-use esp_radio::ble::controller::BleConnector;
 
 extern crate alloc;
 
-// This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
+use esp_backtrace as _;
+use esp_bluetooth_test::drv2285::{DRV2285, Direction};
+use esp_hal::{
+    clock::CpuClock,
+    efuse,
+    gpio::{Level, Output, OutputConfig},
+    timer::timg::TimerGroup,
+};
+use log::info;
+use static_cell::StaticCell;
+
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[main]
-fn main() -> ! {
+#[esp_rtos::main]
+async fn main(spawner: embassy_executor::Spawner) {
     esp_println::logger::init_logger_from_env();
 
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let peripherals = esp_hal::init(config);
+    let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
 
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
-    // COEX needs more RAM - so we've added some more
-    esp_alloc::heap_allocator!(size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 72 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0);
-    let radio_init = esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller");
-    let (mut _wifi_controller, _interfaces) =
-        esp_radio::wifi::new(&radio_init, peripherals.WIFI, Default::default())
-            .expect("Failed to initialize Wi-Fi controller");
-    let _connector = BleConnector::new(&radio_init, peripherals.BT, Default::default());
 
+    #[cfg(target_arch = "riscv32")]
+    let sw_int = esp_hal::interrupt::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+
+    esp_rtos::start(
+        timg0.timer0,
+        #[cfg(target_arch = "riscv32")]
+        sw_int.software_interrupt0,
+    );
+
+    static RADIO: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
+    let radio = RADIO.init(esp_radio::init().unwrap());
+
+    // Get device MAC address
+    let _mac_bytes = efuse::Efuse::read_base_mac_address();
+
+    // Initialize stepper motor driver on GPIO pins
+    // Configure GPIO pins for stepper control
+    let step_pin = Output::new(peripherals.GPIO3, Level::Low, OutputConfig::default());
+    let dir_pin = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
+
+    // Create DRV2285 driver instance
+    let mut motor = DRV2285::new(step_pin, dir_pin);
+    motor.set_step_pulse_duration(100); // 10 microsecond pulse width
+
+    // Loop forever: jog forward a few steps
+    info!("Starting stepper motor loop...");
     loop {
-        log::info!("Hello world!");
-        let delay_start = Instant::now();
-        while delay_start.elapsed() < Duration::from_millis(500) {}
+        motor.jog(Direction::Forward, 250, 5).await;
+        embassy_time::Timer::after_millis(100).await;
     }
-
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0/examples/src/bin
 }
